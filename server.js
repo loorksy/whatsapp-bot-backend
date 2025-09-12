@@ -308,3 +308,32 @@ app.post("/bot/stop", auth, (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
+// === DEBUG & TEST endpoints (أضفها قبل app.listen) ===
+
+// /debug: يُظهر حالة البوت الآن (يقبل الهيدر Authorization أو بارام k في الرابط)
+app.get("/debug", (req, res) => {
+  const token = (req.headers.authorization || "").replace("Bearer ", "") || (req.query.k || "");
+  if (token !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  res.json({
+    isReady,
+    running: RUNNING,
+    selectedGroupIds: Array.from(SELECTED_GROUP_IDS),
+    clients: CLIENTS,
+    settings: SETTINGS
+  });
+});
+
+// /test/send: يرسل رسالة تجريبية لمجموعة لتتأكد أن الإرسال يعمل
+app.get("/test/send", async (req, res) => {
+  const token = (req.headers.authorization || "").replace("Bearer ", "") || (req.query.k || "");
+  if (token !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    if (!isReady) return res.status(503).json({ error: "WhatsApp not ready" });
+    const { gid, text = "PONG" } = req.query;
+    if (!gid) return res.status(400).json({ error: "gid required" });
+    await client.sendMessage(gid, text);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
