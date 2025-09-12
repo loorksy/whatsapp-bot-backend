@@ -3,12 +3,13 @@ import cors from "cors";
 import dotenv from "dotenv";
 import qrcode from "qrcode";
 import fs from "fs";
-import { Client, LocalAuth } from "whatsapp-web.js";
+import pkg from "whatsapp-web.js";   // ✅ استيراد بالطريقة الصحيحة
+const { Client, LocalAuth } = pkg;
 
 dotenv.config();
 const app = express();
 app.use(express.json());
-app.use(cors()); // لاحقًا ممكن تخصّص origin
+app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "change-me";
@@ -27,7 +28,7 @@ if (!fs.existsSync("./sessions")) fs.mkdirSync("./sessions", { recursive: true }
 let client;
 let qrDataUrl = null;
 let isReady = false;
-let selectedGroupIds = []; // نخزن IDs المجموعات المختارة هنا (سنستقبلها من الواجهة)
+let selectedGroupIds = []; // نخزن IDs المجموعات المختارة هنا
 
 function initWhatsApp() {
   client = new Client({
@@ -67,14 +68,14 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", isReady });
 });
 
-// إرجاع QR كـ DataURL (للاستهلاك من الواجهة)
+// إرجاع QR كـ DataURL
 app.get("/session/qr", auth, (req, res) => {
   if (qrDataUrl) return res.json({ qr: qrDataUrl });
   if (isReady) return res.json({ message: "Already connected" });
   return res.status(503).json({ error: "QR not available yet" });
 });
 
-// عرض QR سريعًا كصورة (اختياري للتجربة بالمتصفح)
+// عرض QR كصورة للتجربة
 app.get("/session/qr-view", auth, (req, res) => {
   if (!qrDataUrl) return res.status(503).send("QR not ready");
   res.send(`<img src="${qrDataUrl}" style="max-width:320px">`);
@@ -107,18 +108,18 @@ app.post("/groups/select", auth, (req, res) => {
   res.json({ success: true, selectedGroupIds });
 });
 
-// (اختياري) إرجاع الاختيار الحالي
+// إرجاع الاختيار الحالي
 app.get("/groups/selected", auth, (req, res) => {
   res.json({ selectedGroupIds });
 });
 
-// نقاط بدء/إيقاف للبوت (سنكمل المنطق بالخطوات القادمة)
+// بدء البوت (من الواجهة)
 app.post("/bot/start", auth, (req, res) => {
   if (!isReady) return res.status(503).json({ error: "WhatsApp not ready" });
-  // سنستخدم payload الإعدادات/العملاء لاحقًا
-  res.json({ success: true, message: "Bot start accepted" });
+  res.json({ success: true, message: "Bot start accepted", settings: req.body });
 });
 
+// إيقاف البوت
 app.post("/bot/stop", auth, (req, res) => {
   res.json({ success: true, message: "Bot stop accepted" });
 });
