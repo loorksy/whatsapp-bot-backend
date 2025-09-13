@@ -3,7 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import qrcode from "qrcode";
 import fs from "fs";
-import pkg from "whatsapp-web.js"; // ✅ whatsapp-web.js
+import pkg from "whatsapp-web.js";
 const { Client, LocalAuth } = pkg;
 
 dotenv.config();
@@ -15,7 +15,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "change-me";
 
-// مصادقة بسيطة بالـ Bearer
+// مصادقة بسيطة
 function auth(req, res, next) {
   const token = (req.headers.authorization || "").replace("Bearer ", "");
   if (token !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
@@ -30,32 +30,65 @@ let client;
 let qrDataUrl = null;
 let isReady = false;
 
-// نخزن IDs المجموعات المختارة هنا
-let selectedGroupIds = []; // Array<string>
-let SELECTED_GROUP_IDS = new Set(); // Set<string>
+// ===== اختيار المجموعات =====
+let selectedGroupIds = [];
+let SELECTED_GROUP_IDS = new Set();
 
-// ===== حالة البوت/الإعدادات/العملاء =====
+// ===== حالة البوت/العملاء/الإعدادات =====
 let RUNNING = false;
 let CLIENTS = []; // [{ name, emoji? }]
 let SETTINGS = {
   mode: "emoji",          // "emoji" | "text"
   emoji: "✅",
   replyText: "تم ✅",
-  threshold: 0.6,         // 0..1
-  cooldown: 3,            // ثواني بين ردّين في نفس الشات
-  rateLimit: 20,          // حد أقصى / الدقيقة (عام)
-  mustInclude: "",        // كلمات مطلوبة (مسافة تفصل بين الكلمات)
-  mustExclude: "",        // كلمات تمنع التفاعل
+  threshold: 0.6,         // 0..1 (يمكن إرسال 60% من الواجهة، نحول هنا)
+  cooldown: 3,            // ثواني
+  rateLimit: 20,          // ردود/دقيقة كحد أقصى
+  mustInclude: "",
+  mustExclude: "",
   normalizeArabic: true,
-  enableOCR: false,       // placeholder (غير مفعّل هنا)
-  instantEyes: true,      // placeholder
+  enableOCR: false,
+  instantEyes: true,
   timezone: "auto",
   startDate: "",
   startTime: "",
-  dryRun: false
+  dryRun: false,
+  historyOnStart: false,
+  historyLimit: 200
 };
 
-// تطبيع نص عربي مبسّط
+// ===== لوج + طابور =====
+let LOGS = [];
+let MSG_QUEUE = []; // عناصر: {type:"live", msg} أو {type:"history", jid, body}
+function addLog(event, data = {}) {
+  const entry = { ts: new Date().toISOString(), event, ...data };
+  LOGS.unshift(entry);
+  if (LOGS.length > 200) LOGS.pop();
+}
+
+// ===== أدوات مطابقة/سرعة =====
+const lastActionByChat = new Map(); // jid -> timestamp
+let actionsWindow = []; // آخر دقيقة
+
+function canAct(jid) {
+  const now = Date.now();
+  // cooldown per chat
+  const last = lastActionByChat.get(jid) || 0;
+  if ((now - last) / 1000 < Number(SETTINGS.cooldown || 0)) return false;
+
+  // global rate limit per minute
+  const perMin = Number(SETTINGS.rateLimit) || 20;
+  actionsWindow = actionsWindow.filter((t) => now - t < 60_000);
+  if (actionsWindow.length >= perMin) return false;
+  return true;
+}
+function markAct(jid) {
+  const now = Date.now();
+  lastActionByChat.set(jid, now);
+  actionsWindow.push(now);
+}
+
+// تطبيع نص عربي مبسط
 const norm = (s = "") =>
   SETTINGS.normalizeArabic
     ? s
@@ -69,7 +102,7 @@ const norm = (s = "") =>
         .trim()
     : (s || "").toLowerCase().trim();
 
-// تشابه مبسّط: نسبة كلمات الاسم الموجودة بالنص
+// تشابه مبسط: نسبة كلمات الاسم الموجودة بالنص
 function similarity(name, text) {
   name = norm(name);
   text = norm(text);
@@ -82,31 +115,67 @@ function similarity(name, text) {
   return hit / parts.length;
 }
 
-// حدود السرعة/الكول داون
-const lastActionByChat = new Map(); // jid -> timestamp
-let actionsWindow = []; // آخر دقيقة (timestamps)
+// ===== المعالجة الموحدة لرسالة واحدة =====
+async function processOneMessage(jid, body, rawMsg) {
+  if (!RUNNING) return "skip:not_running";
+  const isGroup = jid.endsWith("@g.us");
+  if (!isGroup) return "skip:not_group";
 
-function canAct(jid) {
-  const now = Date.now();
+  // لو ما في اختيار، نعتبر كل المجموعات مسموحة؛ ولو في اختيار، نقيّد عليها
+  if (SELECTED_GROUP_IDS.size > 0 && !SELECTED_GROUP_IDS.has(jid)) return "skip:not_selected";
+  if (!body) return "skip:no_text";
 
-  // cooldown per chat
-  const last = lastActionByChat.get(jid) || 0;
-  if ((now - last) / 1000 < Number(SETTINGS.cooldown || 0)) return false;
+  const T = norm(body);
 
-  // global rate limit per minute
-  const perMin = Number(SETTINGS.rateLimit) || 20;
-  actionsWindow = actionsWindow.filter((t) => now - t < 60_000);
-  if (actionsWindow.length >= perMin) return false;
+  if (SETTINGS.mustInclude) {
+    const need = norm(SETTINGS.mustInclude).split(" ").filter(Boolean);
+    if (!need.every((w) => T.includes(w))) return "skip:mustInclude";
+  }
+  if (SETTINGS.mustExclude) {
+    const ban = norm(SETTINGS.mustExclude).split(" ").filter(Boolean);
+    if (ban.some((w) => T.includes(w))) return "skip:mustExclude";
+  }
 
-  return true;
+  const th = Number(SETTINGS.threshold) || 0.6;
+  let matched = null;
+  let matchedEmoji = SETTINGS.emoji || "✅";
+  for (const c of CLIENTS) {
+    const sc = similarity(c.name || "", T);
+    if (sc >= th) {
+      matched = c;
+      if (c.emoji) matchedEmoji = c.emoji;
+      break;
+    }
+  }
+  if (!matched) return "skip:no_match";
+
+  if (!canAct(jid)) return "skip:rate_or_cooldown";
+
+  if (!SETTINGS.dryRun) {
+    try {
+      if (SETTINGS.mode === "emoji") {
+        if (rawMsg?.react) {
+          await rawMsg.react(matchedEmoji);
+        } else if (rawMsg?.reply) {
+          await rawMsg.reply(matchedEmoji);
+        } else {
+          await client.sendMessage(jid, matchedEmoji);
+        }
+      } else {
+        if (rawMsg?.reply) await rawMsg.reply(SETTINGS.replyText || "تم ✅");
+        else await client.sendMessage(jid, SETTINGS.replyText || "تم ✅");
+      }
+    } catch (e) {
+      console.log("send fail:", e.message);
+    }
+  }
+
+  markAct(jid);
+  addLog("acted", { jid, preview: body.slice(0, 80) });
+  return "ok";
 }
-function markAct(jid) {
-  const now = Date.now();
-  lastActionByChat.set(jid, now);
-  actionsWindow.push(now);
-}
 
-// تهيئة واتساب
+// ===== تهيئة واتساب =====
 function initWhatsApp() {
   client = new Client({
     authStrategy: new LocalAuth({ dataPath: "./sessions" }),
@@ -119,95 +188,59 @@ function initWhatsApp() {
   client.on("qr", async (qr) => {
     qrDataUrl = await qrcode.toDataURL(qr);
     isReady = false;
+    addLog("qr_ready");
     console.log("🔑 QR جاهز للمسح");
   });
 
   client.on("ready", () => {
     isReady = true;
     qrDataUrl = null;
+    addLog("wa_ready");
     console.log("✅ واتساب جاهز");
   });
 
   client.on("disconnected", (reason) => {
     console.log("❌ تم قطع الاتصال:", reason);
+    addLog("wa_disconnected", { reason });
     isReady = false;
-    // إعادة المحاولة
     setTimeout(() => client.initialize(), 2000);
   });
 
-  // الاستماع للرسائل
+  // استقبال الرسائل الحية → ندخلها الطابور
   client.on("message", async (msg) => {
     try {
-      if (!RUNNING) return;
-
-      const jid = msg.from || "";
-      const isGroup = jid.endsWith("@g.us");
-      if (!isGroup) return; // نهتم بالمجموعات فقط
-      if (!SELECTED_GROUP_IDS.has(jid)) return; // ليست ضمن المختارة
-
-      // تجاهل رسائلنا نحن
       if (msg.fromMe) return;
-
-      // نص الرسالة/التعليق
-      const text = msg.body || "";
-      const T = norm(text);
-
-      // شروط الكلمات
-      if (SETTINGS.mustInclude) {
-        const need = norm(SETTINGS.mustInclude).split(" ").filter(Boolean);
-        const ok = need.every((w) => T.includes(w));
-        if (!ok) return;
-      }
-      if (SETTINGS.mustExclude) {
-        const ban = norm(SETTINGS.mustExclude).split(" ").filter(Boolean);
-        const bad = ban.some((w) => T.includes(w));
-        if (bad) return;
-      }
-
-      // المطابقة مع العملاء
-      const th = Number(SETTINGS.threshold) || 0.6;
-      let matched = null;
-      let matchedEmoji = SETTINGS.emoji || "✅";
-
-      for (const c of CLIENTS) {
-        const sc = similarity(c.name || "", T);
-        if (sc >= th) {
-          matched = c;
-          if (c.emoji) matchedEmoji = c.emoji;
-          break;
-        }
-      }
-      if (!matched) return;
-
-      // حدود السرعة
-      if (!canAct(jid)) return;
-
-      // الرد
-      if (!SETTINGS.dryRun) {
-        if (SETTINGS.mode === "emoji") {
-          // تفاعل إيموجي
-          // مدعوم في whatsapp-web.js >= 1.20 تقريبًا
-          try {
-            await msg.react(matchedEmoji);
-          } catch (e) {
-            // بديل: إرسال رسالة قصيرة بدل الريأكشن
-            await msg.reply(matchedEmoji);
-          }
-        } else {
-          await msg.reply(SETTINGS.replyText || "تم ✅");
-        }
-      }
-
-      // علِّم التنفيذ (لحدود السرعة/الكول داون)
-      markAct(jid);
+      addLog("message_in", { from: msg.from, body: (msg.body || "").slice(0, 120) });
+      MSG_QUEUE.push({ type: "live", msg });
     } catch (e) {
-      console.error("message handler error:", e.message);
+      console.error("enqueue error:", e.message);
     }
   });
 
   client.initialize();
 }
 initWhatsApp();
+
+// ===== عامل الطابور (كل 400ms) =====
+setInterval(async () => {
+  try {
+    if (!RUNNING) return;
+    if (!MSG_QUEUE.length) return;
+    const item = MSG_QUEUE.shift();
+    if (!item) return;
+
+    if (item.type === "live") {
+      const m = item.msg;
+      const jid = m.from || "";
+      await processOneMessage(jid, m.body || "", m);
+    } else if (item.type === "history") {
+      const { jid, body } = item;
+      await processOneMessage(jid, body, null);
+    }
+  } catch (e) {
+    console.error("queue worker err:", e.message);
+  }
+}, 400);
 
 // ============ API ============
 
@@ -229,7 +262,7 @@ app.get("/session/qr-view", auth, (req, res) => {
   res.send(`<img src="${qrDataUrl}" style="max-width:320px">`);
 });
 
-// جلب المجموعات بعد الاتصال
+// جلب المجموعات
 app.get("/chats", auth, async (req, res) => {
   if (!isReady) return res.status(503).json({ error: "WhatsApp not ready" });
   try {
@@ -248,44 +281,67 @@ app.get("/chats", auth, async (req, res) => {
   }
 });
 
-// حفظ اختيار المجموعات (IDs)
+// حفظ اختيار المجموعات
 app.post("/groups/select", auth, (req, res) => {
   const { ids } = req.body || {};
-  if (!Array.isArray(ids))
-    return res.status(400).json({ error: "ids must be an array" });
+  if (!Array.isArray(ids)) return res.status(400).json({ error: "ids must be an array" });
   selectedGroupIds = ids;
   SELECTED_GROUP_IDS = new Set(ids);
+  addLog("groups_select", { count: ids.length });
   res.json({ success: true, selectedGroupIds });
 });
 
-// إرجاع الاختيار الحالي
+// رجوع الاختيار
 app.get("/groups/selected", auth, (req, res) => {
-  res.json({ selectedGroupIds });
+  res.json({ selectedGroupIds: Array.from(SELECTED_GROUP_IDS) });
 });
 
-// بدء البوت: نحفظ العملاء/الإعدادات ونشغّل
+// بدء البوت
 app.post("/bot/start", auth, (req, res) => {
   try {
-    if (!isReady)
-      return res.status(503).json({ error: "WhatsApp not ready" });
+    if (!isReady) return res.status(503).json({ error: "WhatsApp not ready" });
 
-    const { clients = [], groups = [], settings = {} } = req.body || {};
-    // العملاء (من الواجهة: [{name,emoji?}])
-    CLIENTS = Array.isArray(clients) ? clients.filter(c => c && c.name) : [];
+    const { clients = [], settings = {} } = req.body || {};
+    CLIENTS = Array.isArray(clients) ? clients.filter((c) => c && c.name) : [];
 
-    // الإعدادات
+    // دعم threshold كنسبة (60) أو كقيمة (0.6)
+    const incomingTh = settings.threshold ?? SETTINGS.threshold;
+    const th = Number(incomingTh);
     SETTINGS = {
       ...SETTINGS,
       ...settings,
-      threshold: Math.max(0, Math.min(1, Number(settings.threshold || SETTINGS.threshold) / (settings.threshold > 1 ? 100 : 1))) // يدعم 60 أو 0.6
+      threshold: th > 1 ? th / 100 : th
     };
 
-    // لو في أسماء مجموعات فقط، نعتمد IDs المحفوظة من /groups/select
-    // (الواجهة أصلاً ترسل /groups/select قبل البدء)
     RUNNING = true;
+    addLog("bot_start", {
+      clients: CLIENTS.length,
+      groupsSelected: Array.from(SELECTED_GROUP_IDS),
+      settings: SETTINGS
+    });
 
-    console.log("▶️ BOT START",
-      { clients: CLIENTS.length, groupsSelected: SELECTED_GROUP_IDS.size, settings: SETTINGS });
+    // تشغيل فحص الأرشيف تلقائيًا على البدء (اختياري)
+    if (SETTINGS.historyOnStart) {
+      (async () => {
+        try {
+          const limit = Math.min(Number(SETTINGS.historyLimit || 200), 1000);
+          const groups = Array.from(SELECTED_GROUP_IDS);
+          for (const gid of groups) {
+            const chat = await client.getChatById(gid);
+            const msgs = await chat.fetchMessages({ limit });
+            msgs.reverse().forEach((m) => {
+              if (m.fromMe) return;
+              const body = m.body || "";
+              if (!body) return;
+              MSG_QUEUE.push({ type: "history", jid: gid, body });
+            });
+          }
+          addLog("history_scan_autostart", { groups: groups.length, limit });
+        } catch (e) {
+          console.error("auto history scan fail:", e.message);
+        }
+      })();
+    }
 
     return res.json({
       success: true,
@@ -301,31 +357,72 @@ app.post("/bot/start", auth, (req, res) => {
 // إيقاف البوت
 app.post("/bot/stop", auth, (req, res) => {
   RUNNING = false;
-  console.log("⏸️ BOT STOP");
+  addLog("bot_stop");
   res.json({ success: true, running: RUNNING });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
-// === DEBUG & TEST endpoints (أضفها قبل app.listen) ===
+// فحص الأرشيف يدويًا
+app.post("/history/scan", auth, async (req, res) => {
+  try {
+    if (!isReady) return res.status(503).json({ error: "WhatsApp not ready" });
+    const limit = Math.min(Number(req.body?.limit || 200), 1000);
+    const groups =
+      Array.isArray(req.body?.groups) && req.body.groups.length
+        ? req.body.groups
+        : Array.from(SELECTED_GROUP_IDS);
 
-// /debug: يُظهر حالة البوت الآن (يقبل الهيدر Authorization أو بارام k في الرابط)
+    if (!groups.length) return res.status(400).json({ error: "no groups selected" });
+
+    let enq = 0;
+    for (const gid of groups) {
+      const chat = await client.getChatById(gid);
+      const msgs = await chat.fetchMessages({ limit });
+      msgs.reverse().forEach((m) => {
+        if (m.fromMe) return;
+        const body = m.body || "";
+        if (!body) return;
+        MSG_QUEUE.push({ type: "history", jid: gid, body });
+        enq++;
+      });
+    }
+    addLog("history_scan", { groups: groups.length, enqueued: enq, limit });
+    res.json({ ok: true, groups: groups.length, enqueued: enq });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// مسح الطابور يدويًا (اختياري)
+app.post("/queue/flush", auth, (req, res) => {
+  const n = MSG_QUEUE.length;
+  MSG_QUEUE = [];
+  res.json({ ok: true, cleared: n });
+});
+
+// لوج
+app.get("/logs", auth, (req, res) => {
+  res.json(LOGS);
+});
+
+// Debug سريع (يدعم query k)
 app.get("/debug", (req, res) => {
-  const token = (req.headers.authorization || "").replace("Bearer ", "") || (req.query.k || "");
+  const token =
+    (req.headers.authorization || "").replace("Bearer ", "") || (req.query.k || "");
   if (token !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
   res.json({
     isReady,
     running: RUNNING,
     selectedGroupIds: Array.from(SELECTED_GROUP_IDS),
     clients: CLIENTS,
-    settings: SETTINGS
+    settings: SETTINGS,
+    queueSize: MSG_QUEUE.length
   });
 });
 
-// /test/send: يرسل رسالة تجريبية لمجموعة لتتأكد أن الإرسال يعمل
+// اختبار إرسال
 app.get("/test/send", async (req, res) => {
-  const token = (req.headers.authorization || "").replace("Bearer ", "") || (req.query.k || "");
+  const token =
+    (req.headers.authorization || "").replace("Bearer ", "") || (req.query.k || "");
   if (token !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
   try {
     if (!isReady) return res.status(503).json({ error: "WhatsApp not ready" });
@@ -336,4 +433,8 @@ app.get("/test/send", async (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
